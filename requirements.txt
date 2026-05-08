@@ -1,14 +1,8 @@
-# Telegram bot framework
+# Telegram bot framework (v21+)
 python-telegram-bot==21.5
 
-# Flask — lightweight webhook server for Helius callbacks
-flask==3.0.3
-
-# APScheduler — background polling for EVM chains
+# Background job scheduler — EVM polling via Moralis
 APScheduler==3.10.4
 
-# HTTP client for Moralis / Helius REST calls
+# HTTP client for Moralis REST calls
 requests==2.32.3
-
-# Production WSGI server (used alongside Flask in Railway deployment)
-gunicorn==22.0.0
