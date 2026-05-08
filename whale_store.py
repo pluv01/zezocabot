@@ -126,3 +126,9 @@ class WhaleStore:
                     w["dormant_days"] = self._compute_dormant_days(w)
                     break
             self._write(data)
+
+    def clear_all(self):
+        """Remove all tracked whales from the store."""
+        with self._lock:
+            self._write({"whales": []})
+            log.info("Whale store cleared")
