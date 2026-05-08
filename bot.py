@@ -1,18 +1,12 @@
 """
-Dormant Whale Activity Telegram Bot — Webhook Mode
+Dormant Whale Activity Telegram Bot — Polling Mode
 ====================================================
-Runs as a Railway WEB service (not worker). Railway exposes a public
-HTTPS URL; we register that with Telegram as the webhook endpoint.
-PTB's built-in webhook server handles incoming updates — no Flask needed.
-
-Why webhook over polling on Railway:
-  - Polling requires Railway to allow outbound long-poll connections (~30s).
-    Some Railway plans throttle or reset these, causing silent update loss.
-  - Webhook = Telegram pushes updates to us over a standard HTTPS POST.
-    Railway handles inbound HTTPS natively; this is always reliable.
+Runs as a Railway WORKER service. No public domain or port needed.
+Telegram polling works reliably on Railway workers once any stale
+webhook is deleted on startup (handled automatically in _post_init).
 
 Architecture:
-  - PTB Application in webhook mode (built-in HTTPS server on $PORT)
+  - PTB Application with run_polling() — simple, no web server needed
   - APScheduler polls Moralis every N minutes for ETH/BSC whale activity
   - whales.json stores wallet list (mount a Railway Volume at /app)
 
@@ -20,21 +14,19 @@ Required env vars  (set in Railway → Variables):
   TELEGRAM_TOKEN          BotFather token
   TELEGRAM_CHAT_ID        Your personal Telegram user/chat ID
   MORALIS_API_KEY         Moralis Web3 API key
-  RAILWAY_PUBLIC_DOMAIN   Set automatically by Railway (e.g. foo.up.railway.app)
 
 Optional env vars:
-  WEBHOOK_SECRET_TOKEN    Random string for Telegram → bot request auth
+  HELIUS_API_KEY          Needed for Solana autopopulate holder lookups
   MIN_USD_VALUE           Default 10000
   DORMANT_DAYS_MIN        Default 45
   MORALIS_POLL_MINS       Default 5
-  PORT                    Set automatically by Railway
+  AUTO_POPULATE_HOUR      UTC hour for daily scan, default 6
   WHALES_FILE             Default whales.json
 """
 
 import asyncio
 import logging
 import os
-import secrets
 import sys
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -81,19 +73,11 @@ TELEGRAM_TOKEN   = _require_env("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = _require_env("TELEGRAM_CHAT_ID")
 MORALIS_API_KEY  = _require_env("MORALIS_API_KEY")
 
-# Railway injects RAILWAY_PUBLIC_DOMAIN automatically — e.g. "foo.up.railway.app"
-RAILWAY_DOMAIN   = _require_env("RAILWAY_PUBLIC_DOMAIN")
-WEBHOOK_URL      = f"https://{RAILWAY_DOMAIN}/telegram"
-
-# A secret token Telegram includes in every webhook request header.
-# We verify it so only Telegram can trigger our handler.
-# Auto-generate one if not set — safe, but set it explicitly for consistency.
-WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET_TOKEN") or secrets.token_hex(32)
+# No webhook server needed — polling mode works reliably on Railway workers.
 
 MIN_USD_VALUE     = int(os.environ.get("MIN_USD_VALUE",    "10000"))
 DORMANT_DAYS_MIN  = int(os.environ.get("DORMANT_DAYS_MIN", "45"))
 MORALIS_POLL_MINS = int(os.environ.get("MORALIS_POLL_MINS","5"))
-PORT              = int(os.environ.get("PORT",             "8080"))
 WHALES_FILE           = os.environ.get("WHALES_FILE", "whales.json")
 HELIUS_API_KEY        = os.environ.get("HELIUS_API_KEY", "")
 AUTO_POPULATE_HOUR    = int(os.environ.get("AUTO_POPULATE_HOUR", "6"))  # UTC hour for daily run
@@ -258,8 +242,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"<b>🐳 Whale Bot Status</b>\n"
         f"{'─' * 22}\n"
-        f"🟢 Running (webhook mode)\n"
-        f"🌐 URL: <code>{WEBHOOK_URL}</code>\n"
+        f"🟢 Running (polling mode)\n"
         f"📋 Wallets: {len(whales)} (SOL: {sol_count} | EVM: {evm_count})\n"
         f"💰 Min alert: ${MIN_USD_VALUE:,}\n"
         f"💤 Dormancy: {DORMANT_DAYS_MIN} days\n"
@@ -284,13 +267,20 @@ async def fallback_echo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _post_init(application: Application) -> None:
     """
-    Called inside the PTB event loop before the webhook server starts.
-    Registers our webhook URL with Telegram and captures the event loop.
+    Runs inside the PTB event loop before polling starts.
+    Deletes any stale webhook (would silently block polling) and confirms identity.
     """
     global _event_loop
     _event_loop = asyncio.get_running_loop()
 
-    # Confirm token works before going further
+    # Delete any registered webhook — if one exists, Telegram ignores getUpdates entirely
+    try:
+        deleted = await application.bot.delete_webhook(drop_pending_updates=True)
+        log.info("delete_webhook: %s", "cleared stale webhook" if deleted else "none registered")
+    except TelegramError as e:
+        log.warning("delete_webhook failed (non-fatal): %s", e)
+
+    # Confirm token + API reachability — exits cleanly if token is wrong
     try:
         me = await application.bot.get_me()
         log.info("Bot identity: @%s (id=%s)", me.username, me.id)
@@ -298,41 +288,13 @@ async def _post_init(application: Application) -> None:
         log.critical("get_me() failed — check TELEGRAM_TOKEN: %s", e)
         sys.exit(1)
 
-    # Register webhook with Telegram
-    # allowed_updates limits what Telegram sends us (saves bandwidth)
-    try:
-        await application.bot.set_webhook(
-            url=WEBHOOK_URL,
-            secret_token=WEBHOOK_SECRET,
-            allowed_updates=["message", "edited_message", "callback_query"],
-            drop_pending_updates=True,
-        )
-        log.info("Webhook registered: %s", WEBHOOK_URL)
-    except TelegramError as e:
-        log.critical("set_webhook() failed: %s", e)
-        sys.exit(1)
-
-    # Verify Telegram accepted it
-    try:
-        wh_info = await application.bot.get_webhook_info()
-        log.info(
-            "Webhook confirmed — url=%s pending=%s last_error=%s",
-            wh_info.url,
-            wh_info.pending_update_count,
-            wh_info.last_error_message or "none",
-        )
-    except TelegramError as e:
-        log.warning("get_webhook_info() failed (non-fatal): %s", e)
-
     # Startup summary
     whales = store.list_whales()
     print("", flush=True)
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", flush=True)
     print("🐳  Dormant Whale Monitor — READY",   flush=True)
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", flush=True)
-    print(f"   Mode            : webhook",        flush=True)
-    print(f"   Webhook URL     : {WEBHOOK_URL}",  flush=True)
-    print(f"   Listening port  : {PORT}",         flush=True)
+    print(f"   Mode            : polling",        flush=True)
     print(f"   Wallets tracked : {len(whales)}",  flush=True)
     print(f"   Min USD value   : ${MIN_USD_VALUE:,}", flush=True)
     print(f"   Dormancy min    : {DORMANT_DAYS_MIN} days", flush=True)
@@ -341,15 +303,6 @@ async def _post_init(application: Application) -> None:
     print(f"   Helius key      : {'set' if HELIUS_API_KEY else 'NOT SET (SOL disabled)'}", flush=True)
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", flush=True)
     print("", flush=True)
-
-
-async def _post_shutdown(application: Application) -> None:
-    """Clean up webhook registration on graceful shutdown."""
-    try:
-        await application.bot.delete_webhook()
-        log.info("Webhook deleted on shutdown")
-    except TelegramError as e:
-        log.warning("Could not delete webhook on shutdown: %s", e)
 
 
 async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -565,18 +518,17 @@ def _daily_autopopulate() -> None:
 def main() -> None:
     global _app
 
-    log.info("Building application in webhook mode (domain=%s, port=%d)…",
-             RAILWAY_DOMAIN, PORT)
+    log.info("Building application in polling mode…")
 
     _app = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
         .post_init(_post_init)
-        .post_shutdown(_post_shutdown)
         .connect_timeout(30)
         .read_timeout(30)
         .write_timeout(30)
         .pool_timeout(30)
+        .get_updates_read_timeout(45)
         .build()
     )
 
@@ -616,22 +568,10 @@ def main() -> None:
     scheduler.start()
     log.info("APScheduler started — EVM poll every %d min", MORALIS_POLL_MINS)
 
-    # run_webhook:
-    #   listen="0.0.0.0"      → bind to all interfaces (required on Railway)
-    #   port=PORT              → Railway's injected $PORT
-    #   url_path="/telegram"   → must match WEBHOOK_URL path above
-    #   secret_token           → validates that requests come from Telegram
-    #   webhook_url            → tells PTB to call set_webhook() automatically
-    #                            (we also call it in _post_init for logging)
-    log.info("Starting webhook server on 0.0.0.0:%d/telegram…", PORT)
-    _app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path="/telegram",
-        secret_token=WEBHOOK_SECRET,
-        webhook_url=WEBHOOK_URL,
+    log.info("Starting Telegram polling…")
+    _app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
-        close_loop=False,
     )
 
     log.info("Shutting down…")
