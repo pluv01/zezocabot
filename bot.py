@@ -370,10 +370,9 @@ async def cmd_autopopulate(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         lines = [f"✅ <b>Added {len(new_whales)} dormant whale(s) on {chain.upper()}</b>\\n"]
         for w in new_whales[:15]:   # show first 15 to avoid Telegram message length limit
             addr    = w["address"]
-            short   = f"{addr[:6]}…{addr[-4:]}"
             dormant = w.get("dormant_days", "?")
             last    = w.get("last_active_date", "unknown")
-            lines.append(f"• <code>{short}</code> — {dormant}d dormant (last: {last})")
+            lines.append(f"• <code>{addr}</code> — {dormant}d dormant (last: {last})")
 
         if len(new_whales) > 15:
             lines.append(f"<i>…and {len(new_whales) - 15} more. Use /listwhales to see all.</i>")
