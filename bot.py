@@ -1,22 +1,14 @@
 """
 Dormant Whale Activity Telegram Bot
 =====================================
-Monitors known whale wallets across Solana, ETH, and BSC.
-Alerts when a dormant whale (45+ days inactive) makes a significant
-memecoin move (> $10k USD).
+Polling-only version — no Flask, no webhook server.
 
-Architecture:
-  - python-telegram-bot v21+ with ApplicationBuilder + run_polling()
-  - Flask handles incoming Helius webhooks (Solana) in a daemon thread
-  - APScheduler polls Moralis every N minutes for ETH/BSC wallets
-  - Cross-thread alerts sent safely via asyncio.run_coroutine_threadsafe()
-    using the Application's event loop (the correct PTB v21 approach)
-  - whales.json is the persistent wallet store
+Monitors ETH + BSC whale wallets via Moralis (APScheduler).
+Solana (Helius) requires a public HTTP endpoint; add that back
+as a separate service once you've confirmed commands work.
 
-Railway notes:
-  - Procfile uses "worker: python bot.py" (no web dyno / PORT needed)
-  - Set a Volume mounted at /app so whales.json survives redeploys
-  - All config comes from environment variables (see .env.example)
+Deploy on Railway as a WORKER (Procfile: "worker: python bot.py").
+No PORT binding, no web dyno — just a long-running Python process.
 """
 
 import asyncio
@@ -25,10 +17,9 @@ import os
 import sys
 import threading
 
-from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Update
-from telegram.error import TelegramError
+from telegram.error import NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -38,116 +29,119 @@ from telegram.ext import (
     filters,
 )
 
-from alert_builder import build_alert, parse_helius_event
-from helius_webhook import register_address_with_helius, verify_helius_signature
 from moralis_monitor import check_evm_whales
 from whale_store import WhaleStore
 
 # ── Logging ───────────────────────────────────────────────────────────────────
-# stdout + structured format works well with Railway's log viewer
 logging.basicConfig(
     stream=sys.stdout,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%SZ",
     level=logging.INFO,
-    force=True,   # override any library-level root handlers
+    force=True,
 )
-# Silence noisy libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
-logging.getLogger("werkzeug").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 log = logging.getLogger("whale_bot")
 
 
-# ── Startup env validation ────────────────────────────────────────────────────
+# ── Env validation ────────────────────────────────────────────────────────────
 def _require_env(name: str) -> str:
-    """Exit immediately with a clear message if a required env var is missing."""
     val = os.environ.get(name, "").strip()
     if not val:
-        log.critical("MISSING required environment variable: %s", name)
+        log.critical("MISSING required environment variable: %s — exiting", name)
         sys.exit(1)
     return val
 
 
-TELEGRAM_TOKEN        = _require_env("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID      = _require_env("TELEGRAM_CHAT_ID")
-HELIUS_API_KEY        = _require_env("HELIUS_API_KEY")
-MORALIS_API_KEY       = _require_env("MORALIS_API_KEY")
+TELEGRAM_TOKEN   = _require_env("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = _require_env("TELEGRAM_CHAT_ID")
+MORALIS_API_KEY  = _require_env("MORALIS_API_KEY")
 
-# Optional / defaulted
-HELIUS_WEBHOOK_SECRET = os.environ.get("HELIUS_WEBHOOK_SECRET", "")
-HELIUS_WEBHOOK_URL    = os.environ.get("HELIUS_WEBHOOK_URL", "")
-MIN_USD_VALUE         = int(os.environ.get("MIN_USD_VALUE", "10000"))
-DORMANT_DAYS_MIN      = int(os.environ.get("DORMANT_DAYS_MIN", "45"))
-MORALIS_POLL_MINS     = int(os.environ.get("MORALIS_POLL_MINS", "5"))
-FLASK_PORT            = int(os.environ.get("PORT", "8080"))
+MIN_USD_VALUE     = int(os.environ.get("MIN_USD_VALUE",    "10000"))
+DORMANT_DAYS_MIN  = int(os.environ.get("DORMANT_DAYS_MIN", "45"))
+MORALIS_POLL_MINS = int(os.environ.get("MORALIS_POLL_MINS","5"))
+WHALES_FILE       = os.environ.get("WHALES_FILE", "whales.json")
 
-# Whale store (JSON file — mount /app as Railway Volume for persistence)
-WHALES_FILE = os.environ.get("WHALES_FILE", "whales.json")
 store = WhaleStore(WHALES_FILE)
 
-# PTB Application and its event loop — set in main() / post_init before threads use them
-_app: Application | None = None
-_event_loop: asyncio.AbstractEventLoop | None = None
+# Set in _post_init, used by APScheduler thread to dispatch alerts
+_app:        Application | None                  = None
+_event_loop: asyncio.AbstractEventLoop | None    = None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Alert dispatch (thread-safe)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Alert dispatch (thread-safe from APScheduler) ─────────────────────────────
 
-async def _send_telegram(message: str) -> None:
-    """Coroutine: send a Telegram HTML message. Runs on the PTB event loop."""
+async def _send_telegram(text: str) -> None:
     try:
         await _app.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=message,
+            text=text,
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
     except TelegramError as e:
-        log.error("Telegram send failed: %s", e)
+        log.error("Failed to send alert: %s", e)
 
 
-def dispatch_alert(message: str) -> None:
-    """
-    Thread-safe alert sender for Flask / APScheduler threads.
-
-    PTB v21 runs its own asyncio event loop in the main thread.
-    We schedule a coroutine on that loop using run_coroutine_threadsafe() —
-    the correct PTB v21 pattern. Never access _app.bot._request internals.
-    """
+def dispatch_alert(text: str) -> None:
+    """Schedule an alert coroutine on the PTB event loop from any thread."""
     if _app is None or _event_loop is None:
-        log.warning("Alert dropped — bot not initialised yet")
+        log.warning("Alert dropped — bot not ready: %s", text[:60])
         return
-    asyncio.run_coroutine_threadsafe(_send_telegram(message), _event_loop)
+    asyncio.run_coroutine_threadsafe(_send_telegram(text), _event_loop)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Telegram command handlers
+# Command handlers
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info("/start received from user_id=%s", update.effective_user.id)
     await update.message.reply_text(
         "🐳 <b>Dormant Whale Monitor</b>\n\n"
-        "Track whale wallets on SOL, ETH, and BSC.\n"
-        "Alerts fire when a dormant wallet wakes up with a large move.\n\n"
+        "I watch whale wallets and alert you when a dormant wallet "
+        "wakes up with a large memecoin move.\n\n"
         "<b>Commands:</b>\n"
-        "• /addwhale <code>&lt;address&gt; &lt;chain&gt;</code>\n"
-        "• /listwhales\n"
-        "• /removewhale <code>&lt;address&gt;</code>\n"
-        "• /status",
+        "• /addwhale <code>&lt;address&gt; &lt;chain&gt;</code> — track a wallet\n"
+        "• /listwhales — show all tracked wallets\n"
+        "• /removewhale <code>&lt;address&gt;</code> — stop tracking\n"
+        "• /status — bot config and stats\n"
+        "• /help — show this message\n\n"
+        "<i>Chains supported: sol (alerts via polling), eth, bsc</i>",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info("/help received from user_id=%s", update.effective_user.id)
+    await update.message.reply_text(
+        "📖 <b>Whale Bot Help</b>\n\n"
+        "<b>/addwhale</b> <code>&lt;address&gt; &lt;chain&gt;</code>\n"
+        "  Add a wallet to monitor. Example:\n"
+        "  <code>/addwhale 0xABC...123 eth</code>\n\n"
+        "<b>/listwhales</b>\n"
+        "  List all tracked wallets with last-seen dates.\n\n"
+        "<b>/removewhale</b> <code>&lt;address&gt;</code>\n"
+        "  Stop monitoring a wallet.\n\n"
+        "<b>/status</b>\n"
+        "  Show current config: thresholds, poll interval, wallet count.\n\n"
+        "💡 <i>Alerts fire when a wallet dormant for "
+        f"{DORMANT_DAYS_MIN}+ days moves more than ${MIN_USD_VALUE:,} in a single tx.</i>",
         parse_mode="HTML",
     )
 
 
 async def cmd_addwhale(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """/addwhale <address> <chain>  — chain must be sol | eth | bsc"""
+    log.info("/addwhale received from user_id=%s args=%s", update.effective_user.id, ctx.args)
     args = ctx.args or []
     if len(args) != 2:
         await update.message.reply_text(
-            "Usage: /addwhale <address> <chain>\n"
-            "Chains: <code>sol</code>, <code>eth</code>, <code>bsc</code>",
+            "Usage: /addwhale <code>&lt;address&gt; &lt;chain&gt;</code>\n"
+            "Chains: <code>sol</code>, <code>eth</code>, <code>bsc</code>\n\n"
+            "Example: <code>/addwhale 0xABC...123 eth</code>",
             parse_mode="HTML",
         )
         return
@@ -157,43 +151,47 @@ async def cmd_addwhale(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if chain not in ("sol", "eth", "bsc"):
         await update.message.reply_text(
-            "Chain must be one of: <code>sol</code>, <code>eth</code>, <code>bsc</code>",
+            "⚠️ Chain must be <code>sol</code>, <code>eth</code>, or <code>bsc</code>.",
             parse_mode="HTML",
         )
         return
 
     store.add_whale(address, chain)
-    log.info("Added whale: %s (%s)", address, chain)
+    log.info("Whale added: %s (%s)", address, chain)
 
-    helius_note = ""
+    note = ""
     if chain == "sol":
-        if HELIUS_WEBHOOK_URL:
-            ok = register_address_with_helius(address, HELIUS_API_KEY)
-            helius_note = "\n✅ Registered with Helius" if ok else "\n⚠️ Helius registration failed — check logs"
-        else:
-            helius_note = "\n⚠️ HELIUS_WEBHOOK_URL not set — register manually in Helius dashboard"
+        note = (
+            "\n\n⚠️ <i>Solana monitoring in polling-only mode requires a Helius webhook "
+            "endpoint. This wallet is saved but won't trigger alerts until you "
+            "re-enable the Flask webhook server.</i>"
+        )
 
     await update.message.reply_text(
-        f"✅ Now tracking <code>{address}</code> ({chain.upper()}){helius_note}",
+        f"✅ Now tracking <code>{address}</code> ({chain.upper()}){note}",
         parse_mode="HTML",
     )
 
 
 async def cmd_listwhales(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info("/listwhales received from user_id=%s", update.effective_user.id)
     whales = store.list_whales()
     if not whales:
-        await update.message.reply_text("No whales tracked yet. Use /addwhale to add one.")
+        await update.message.reply_text(
+            "No whales tracked yet.\nUse /addwhale to add one."
+        )
         return
 
     lines = [f"<b>Tracked Whales ({len(whales)})</b>\n"]
     for w in whales:
         addr        = w["address"]
         short       = f"{addr[:6]}…{addr[-4:]}"
+        chain       = w["chain"].upper()
         last        = w.get("last_active_date") or "never seen"
         dormant     = w.get("dormant_days", -1)
         dormant_str = f"{dormant}d ago" if dormant >= 0 else "unknown"
         lines.append(
-            f"• <code>{short}</code> [{w['chain'].upper()}]\n"
+            f"• <code>{short}</code> [{chain}]\n"
             f"  Last active: {last} ({dormant_str})"
         )
 
@@ -201,109 +199,111 @@ async def cmd_listwhales(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_removewhale(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info("/removewhale received from user_id=%s", update.effective_user.id)
     args = ctx.args or []
     if not args:
-        await update.message.reply_text("Usage: /removewhale <address>")
+        await update.message.reply_text("Usage: /removewhale <code>&lt;address&gt;</code>", parse_mode="HTML")
         return
 
     address = args[0].strip()
     if store.remove_whale(address):
-        await update.message.reply_text(f"🗑 Removed <code>{address}</code>", parse_mode="HTML")
-        log.info("Removed whale: %s", address)
+        log.info("Whale removed: %s", address)
+        await update.message.reply_text(
+            f"🗑 Removed <code>{address}</code>", parse_mode="HTML"
+        )
     else:
         await update.message.reply_text("⚠️ Address not found in whale list.")
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log.info("/status received from user_id=%s", update.effective_user.id)
     whales    = store.list_whales()
     sol_count = sum(1 for w in whales if w["chain"] == "sol")
     evm_count = len(whales) - sol_count
 
     await update.message.reply_text(
         f"<b>🐳 Whale Bot Status</b>\n"
-        f"{'─' * 20}\n"
+        f"{'─' * 22}\n"
         f"🟢 Status: Running\n"
         f"📋 Wallets tracked: {len(whales)}\n"
-        f"   • SOL: {sol_count}  |  EVM: {evm_count}\n"
+        f"   SOL: {sol_count}  |  ETH+BSC: {evm_count}\n"
         f"💰 Min alert value: ${MIN_USD_VALUE:,}\n"
-        f"💤 Dormancy threshold: {DORMANT_DAYS_MIN} days\n"
-        f"🔄 EVM poll interval: {MORALIS_POLL_MINS} min\n"
-        f"📁 Store: {WHALES_FILE}",
+        f"💤 Dormancy min: {DORMANT_DAYS_MIN} days\n"
+        f"🔄 EVM poll: every {MORALIS_POLL_MINS} min\n"
+        f"⚡ Mode: polling-only (no webhook server)",
         parse_mode="HTML",
     )
 
-
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Fallback handler — confirms the bot is receiving messages at all
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def fallback_echo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Catches any non-command text message and echoes it back.
-    Useful for diagnosing "bot starts but doesn't respond" issues on Railway.
-    Remove or comment out once you've confirmed commands work.
+    Catches any plain text that isn't a command.
+    Useful for diagnosing delivery issues — if this replies, polling works.
+    Safe to remove once you've confirmed /start responds.
     """
-    text = update.message.text if update.message else "(no text)"
-    log.info("Fallback received from %s: %s", update.effective_user.id, text)
+    text = update.message.text if update.message else ""
+    log.info("Fallback message from user_id=%s: %s", update.effective_user.id, text[:60])
     await update.message.reply_text(
-        f"✅ Bot is alive and receiving messages.\n"
-        f"You sent: <code>{text}</code>\n\n"
-        f"Try a command: /start",
-        parse_mode="HTML",
+        "✅ Bot is alive!\n"
+        "I received your message. Try /start for the command list.",
     )
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# Flask server — Helius webhook receiver
+# PTB lifecycle hooks
 # ══════════════════════════════════════════════════════════════════════════════
 
-flask_app = Flask(__name__)
-
-
-@flask_app.route("/helius-webhook", methods=["POST"])
-def helius_webhook_endpoint():
+async def _post_init(application: Application) -> None:
     """
-    Helius pushes enhanced transaction events here for all registered SOL addresses.
-    Signature is verified if HELIUS_WEBHOOK_SECRET is set.
+    Runs inside the PTB event loop before polling starts.
+    - Deletes any registered webhook (would silently block polling)
+    - Confirms bot identity via get_me()
+    - Captures the event loop for APScheduler thread-safe dispatch
     """
-    raw_body   = request.get_data()
-    sig_header = request.headers.get("Helius-Signature", "")
+    global _event_loop
+    _event_loop = asyncio.get_running_loop()
 
-    if HELIUS_WEBHOOK_SECRET and not verify_helius_signature(raw_body, sig_header, HELIUS_WEBHOOK_SECRET):
-        log.warning("Helius webhook: invalid signature — rejecting request")
-        return jsonify({"error": "invalid signature"}), 401
+    # Delete webhook — MUST happen before polling or Telegram ignores getUpdates
+    try:
+        deleted = await application.bot.delete_webhook(drop_pending_updates=True)
+        log.info("delete_webhook: %s", "cleared" if deleted else "nothing to clear")
+    except TelegramError as e:
+        log.warning("delete_webhook failed (non-fatal): %s", e)
 
-    events = request.get_json(force=True, silent=True) or []
-    if not isinstance(events, list):
-        events = [events]
+    # Confirm token + API reachability
+    try:
+        me = await application.bot.get_me()
+        log.info("Bot identity: @%s (id=%s)", me.username, me.id)
+    except TelegramError as e:
+        log.error("get_me() failed — is TELEGRAM_TOKEN correct? %s", e)
+        sys.exit(1)   # no point continuing if token is broken
 
-    processed = 0
-    for event in events:
-        try:
-            msg = parse_helius_event(event, store, MIN_USD_VALUE, DORMANT_DAYS_MIN)
-            if msg:
-                dispatch_alert(msg)
-                processed += 1
-        except Exception:
-            log.exception("Error processing Helius event")
-
-    return jsonify({"ok": True, "processed": processed}), 200
-
-
-@flask_app.route("/health", methods=["GET"])
-def health_check():
-    """Health probe — hit https://your-app.railway.app/health to verify."""
-    return jsonify({
-        "status":         "ok",
-        "whales_tracked": len(store.list_whales()),
-        "bot_ready":      _app is not None,
-    }), 200
+    # Print startup summary
+    whales = store.list_whales()
+    print("", flush=True)
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", flush=True)
+    print("🐳  Dormant Whale Monitor — READY",   flush=True)
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", flush=True)
+    print(f"   Mode            : polling-only",   flush=True)
+    print(f"   Wallets tracked : {len(whales)}",  flush=True)
+    print(f"   Min USD value   : ${MIN_USD_VALUE:,}", flush=True)
+    print(f"   Dormancy min    : {DORMANT_DAYS_MIN} days", flush=True)
+    print(f"   EVM poll every  : {MORALIS_POLL_MINS} min", flush=True)
+    print(f"   Store file      : {WHALES_FILE}",  flush=True)
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", flush=True)
+    print("", flush=True)
 
 
-def _run_flask() -> None:
-    log.info("Flask webhook server listening on port %d", FLASK_PORT)
-    flask_app.run(host="0.0.0.0", port=FLASK_PORT, use_reloader=False, debug=False)
+async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Keeps the bot alive through network blips and bad updates.
+    TimedOut / NetworkError are normal on Railway — log at WARNING, not ERROR.
+    """
+    err = ctx.error
+    if isinstance(err, (TimedOut, NetworkError)):
+        log.warning("Network issue (will retry): %s", err)
+    else:
+        log.error("Unhandled PTB error: %s", err, exc_info=err)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -311,79 +311,20 @@ def _run_flask() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _poll_evm_whales() -> None:
-    """Runs on a background thread every MORALIS_POLL_MINS minutes."""
     evm_whales = [w for w in store.list_whales() if w["chain"] in ("eth", "bsc")]
     if not evm_whales:
         return
-
     log.info("EVM poll: checking %d wallet(s)…", len(evm_whales))
     try:
-        alerts = check_evm_whales(evm_whales, MORALIS_API_KEY, store, MIN_USD_VALUE, DORMANT_DAYS_MIN)
+        alerts = check_evm_whales(
+            evm_whales, MORALIS_API_KEY, store, MIN_USD_VALUE, DORMANT_DAYS_MIN
+        )
         for msg in alerts:
             dispatch_alert(msg)
         if alerts:
-            log.info("EVM poll: dispatched %d alert(s)", len(alerts))
+            log.info("EVM poll: sent %d alert(s)", len(alerts))
     except Exception:
-        log.exception("EVM poll encountered an error")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PTB hooks
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def _post_init(application: Application) -> None:
-    """
-    Called by PTB after the event loop is running, before polling begins.
-    Capture the running loop here — this is the correct PTB v21 pattern
-    for enabling threadsafe alert dispatch from Flask / APScheduler threads.
-    """
-    global _event_loop
-    _event_loop = asyncio.get_running_loop()
-
-    # ── CRITICAL: delete any registered webhook ───────────────────────────────
-    # Telegram will NOT deliver polling updates if a webhook URL is set.
-    # This happens silently — the bot starts fine but never receives messages.
-    # Always delete on startup so polling works cleanly.
-    try:
-        deleted = await application.bot.delete_webhook(drop_pending_updates=True)
-        if deleted:
-            log.info("Webhook deleted — polling will now receive updates")
-        else:
-            log.info("No webhook was registered")
-    except TelegramError as e:
-        log.warning("Could not delete webhook (non-fatal): %s", e)
-
-    # Confirm bot identity — proves the token works and API is reachable
-    try:
-        me = await application.bot.get_me()
-        log.info("Bot identity confirmed: @%s (id=%s)", me.username, me.id)
-    except TelegramError as e:
-        log.error("get_me() failed — check TELEGRAM_TOKEN: %s", e)
-
-    # Startup health summary printed to Railway logs
-    whales = store.list_whales()
-    print("", flush=True)
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", flush=True)
-    print("🐳  Dormant Whale Monitor — READY", flush=True)
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", flush=True)
-    print(f"   Wallets tracked : {len(whales)}", flush=True)
-    print(f"   Min USD value   : ${MIN_USD_VALUE:,}", flush=True)
-    print(f"   Dormancy min    : {DORMANT_DAYS_MIN} days", flush=True)
-    print(f"   EVM poll every  : {MORALIS_POLL_MINS} min", flush=True)
-    print(f"   Webhook port    : {FLASK_PORT}", flush=True)
-    print(f"   Store file      : {WHALES_FILE}", flush=True)
-    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━", flush=True)
-    print("", flush=True)
-
-    log.info("PTB event loop ready — threadsafe alerts enabled")
-
-
-async def _error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Global PTB error handler — logs exceptions without crashing the bot.
-    Without this, unhandled errors in handlers silently kill polling on some PTB versions.
-    """
-    log.error("Unhandled PTB error (update=%s): %s", update, ctx.error, exc_info=ctx.error)
+        log.exception("EVM poll error")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -398,33 +339,30 @@ def main() -> None:
     _app = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
-        .post_init(_post_init)          # captures loop + deletes webhook before polling
-        .connect_timeout(30)            # seconds to establish connection to Telegram
-        .read_timeout(30)               # seconds to wait for a response
-        .write_timeout(30)              # seconds to wait when sending
-        .pool_timeout(30)               # seconds to wait for a connection from the pool
-        .get_updates_read_timeout(45)   # long-poll window; Telegram holds for ~30s
+        .post_init(_post_init)
+        .connect_timeout(30)
+        .read_timeout(30)
+        .write_timeout(30)
+        .pool_timeout(30)
+        .get_updates_read_timeout(45)   # Telegram long-polls for ~30s; give it headroom
         .build()
     )
 
-    # Command handlers
+    # Commands
     _app.add_handler(CommandHandler("start",       cmd_start))
+    _app.add_handler(CommandHandler("help",        cmd_help))
     _app.add_handler(CommandHandler("addwhale",    cmd_addwhale))
     _app.add_handler(CommandHandler("listwhales",  cmd_listwhales))
     _app.add_handler(CommandHandler("removewhale", cmd_removewhale))
     _app.add_handler(CommandHandler("status",      cmd_status))
 
-    # Fallback: catches plain text messages — remove once commands confirmed working
+    # Fallback: plain text → confirms polling is working end-to-end
     _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_echo))
 
-    # Global error handler — keeps the bot alive on bad updates or network blips
+    # Error handler
     _app.add_error_handler(_error_handler)
 
-    # Flask in a daemon thread (dies when main thread exits)
-    flask_thread = threading.Thread(target=_run_flask, name="flask-webhook", daemon=True)
-    flask_thread.start()
-
-    # APScheduler for EVM polling
+    # EVM polling scheduler
     scheduler = BackgroundScheduler(
         timezone="UTC",
         job_defaults={"misfire_grace_time": 60, "coalesce": True},
@@ -433,18 +371,16 @@ def main() -> None:
     scheduler.start()
     log.info("APScheduler started — EVM poll every %d min", MORALIS_POLL_MINS)
 
-    # run_polling blocks until SIGINT / SIGTERM (Railway sends SIGTERM on redeploy)
-    # drop_pending_updates=True avoids replaying a command backlog on restart
-    log.info("Starting Telegram polling (drop_pending_updates=True)…")
+    # Blocking — exits only on SIGTERM (Railway redeploy) or SIGINT (Ctrl-C)
+    log.info("Starting Telegram polling…")
     _app.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
     )
 
-    # Reached only after Ctrl-C / SIGTERM
-    log.info("Shutting down scheduler…")
+    log.info("Shutting down…")
     scheduler.shutdown(wait=False)
-    log.info("Bot stopped cleanly.")
+    log.info("Clean exit.")
 
 
 if __name__ == "__main__":
