@@ -29,7 +29,14 @@ from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
 from telegram import Update
 from telegram.error import TelegramError
-from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from alert_builder import build_alert, parse_helius_event
 from helius_webhook import register_address_with_helius, verify_helius_signature
@@ -226,6 +233,27 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Fallback handler — confirms the bot is receiving messages at all
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def fallback_echo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Catches any non-command text message and echoes it back.
+    Useful for diagnosing "bot starts but doesn't respond" issues on Railway.
+    Remove or comment out once you've confirmed commands work.
+    """
+    text = update.message.text if update.message else "(no text)"
+    log.info("Fallback received from %s: %s", update.effective_user.id, text)
+    await update.message.reply_text(
+        f"✅ Bot is alive and receiving messages.\n"
+        f"You sent: <code>{text}</code>\n\n"
+        f"Try a command: /start",
+        parse_mode="HTML",
+    )
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Flask server — Helius webhook receiver
 # ══════════════════════════════════════════════════════════════════════════════
@@ -312,6 +340,26 @@ async def _post_init(application: Application) -> None:
     global _event_loop
     _event_loop = asyncio.get_running_loop()
 
+    # ── CRITICAL: delete any registered webhook ───────────────────────────────
+    # Telegram will NOT deliver polling updates if a webhook URL is set.
+    # This happens silently — the bot starts fine but never receives messages.
+    # Always delete on startup so polling works cleanly.
+    try:
+        deleted = await application.bot.delete_webhook(drop_pending_updates=True)
+        if deleted:
+            log.info("Webhook deleted — polling will now receive updates")
+        else:
+            log.info("No webhook was registered")
+    except TelegramError as e:
+        log.warning("Could not delete webhook (non-fatal): %s", e)
+
+    # Confirm bot identity — proves the token works and API is reachable
+    try:
+        me = await application.bot.get_me()
+        log.info("Bot identity confirmed: @%s (id=%s)", me.username, me.id)
+    except TelegramError as e:
+        log.error("get_me() failed — check TELEGRAM_TOKEN: %s", e)
+
     # Startup health summary printed to Railway logs
     whales = store.list_whales()
     print("", flush=True)
@@ -350,7 +398,12 @@ def main() -> None:
     _app = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
-        .post_init(_post_init)       # captures event loop safely before polling
+        .post_init(_post_init)          # captures loop + deletes webhook before polling
+        .connect_timeout(30)            # seconds to establish connection to Telegram
+        .read_timeout(30)               # seconds to wait for a response
+        .write_timeout(30)              # seconds to wait when sending
+        .pool_timeout(30)               # seconds to wait for a connection from the pool
+        .get_updates_read_timeout(45)   # long-poll window; Telegram holds for ~30s
         .build()
     )
 
@@ -360,6 +413,9 @@ def main() -> None:
     _app.add_handler(CommandHandler("listwhales",  cmd_listwhales))
     _app.add_handler(CommandHandler("removewhale", cmd_removewhale))
     _app.add_handler(CommandHandler("status",      cmd_status))
+
+    # Fallback: catches plain text messages — remove once commands confirmed working
+    _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_echo))
 
     # Global error handler — keeps the bot alive on bad updates or network blips
     _app.add_error_handler(_error_handler)
